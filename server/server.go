@@ -6,10 +6,12 @@ import (
 	"log"
 	"net"
 	"net/rpc"
+	"reflect"
 	"regexp"
 	"runtime"
 	"sync"
 	"testing"
+	"time"
 )
 
 var (
@@ -64,8 +66,8 @@ func (s *Server) Benchmarks(filter string, reply *[]int) error {
 
 // Run specifies a single benchmark run.
 type Run struct {
-	I int   // the index of the benchmark, as returned by Benchmarks
-	N int64 // the number of iterations to run for
+	I int // the index of the benchmark, as returned by Benchmarks
+	N int // the number of iterations to run for
 }
 
 // Run executes a single benchmark run.
@@ -96,25 +98,48 @@ type Benchmark struct {
 
 // run runs b for the specified number of iterations.
 func (b *Benchmark) run(n int) testing.BenchmarkResult {
-
 	var wg sync.WaitGroup
 	wg.Add(1)
+	tb := testing.B{N: n}
+	tb.SetParallelism(1)
+
 	go func() {
 		defer wg.Done()
 
 		// Try to get a comparable environment for each run
 		// by clearing garbage from previous runs.
 		runtime.GC()
-		tb := testing.B{N: n}
-		tb.SetParallelism(1)
 		tb.ResetTimer()
 		tb.StartTimer()
 		b.F(&tb)
 		tb.StopTimer()
-
 	}()
 	wg.Wait()
 
-	return testing.BenchmarkResult{}
-	// return testing.BenchmarkResult{b.N, b.duration, b.bytes, b.netAllocs, b.netBytes}
+	v := reflect.ValueOf(tb)
+	r := testing.BenchmarkResult{
+		N:         n,
+		T:         time.Duration(extractInt(v, "duration")),
+		Bytes:     extractInt(v, "bytes"),
+		MemAllocs: extractUint(v, "netAllocs"),
+		MemBytes:  extractUint(v, "netBytes"),
+	}
+
+	return r
+}
+
+func extractInt(v reflect.Value, field string) int64 {
+	x, ok := v.Type().FieldByName(field)
+	if !ok {
+		panic("failed to find testing.B field: " + field)
+	}
+	return v.FieldByIndex(x.Index).Int()
+}
+
+func extractUint(v reflect.Value, field string) uint64 {
+	x, ok := v.Type().FieldByName(field)
+	if !ok {
+		panic("failed to find testing.B field: " + field)
+	}
+	return v.FieldByIndex(x.Index).Uint()
 }
