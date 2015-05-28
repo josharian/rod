@@ -1,103 +1,179 @@
 package server
 
 import (
-	"errors"
+	"bufio"
 	"flag"
-	"log"
-	"net"
-	"net/rpc"
+	"fmt"
+	"os"
 	"reflect"
-	"regexp"
 	"runtime"
+	"strconv"
+	"strings"
 	"sync"
 	"testing"
 	"time"
+	"unsafe"
 )
 
-var (
-	benchserve     = flag.Bool("test.benchserve", false, "run benchmarking server")
-	benchserveaddr = flag.String("test.benchserveaddr", ":9998", "benchmarking server address")
-
-	server = new(Server)
-)
-
-// Start starts the benchmark server, if the test.benchserve flag is set.
-// Start blocks until the server encounters an error if serving.
-// If not serving, Start returns immediately.
-// We use this to hijack the test running system to allow us to run our benchmark
-// server without having to alter main or collide with a user's existing testing.M.
-// Set -test.timeout=10000h to allow the server to run as long as needed.
-func Start() {
-	if *benchserve {
-		server.serve()
-	}
-}
-
-// Register registers the benchmarks bb with the server.
-// All calls to register must happen before calls to Start.
-// Register is usually called from auto-generated init functions.
-func Register(bb []Benchmark) {
-	server.benchmarks = append(server.benchmarks, bb...)
-}
-
-type Server struct {
-	benchmarks []Benchmark
-}
-
-// Benchmarks returns the indices of all benchmarks matching filter.
-// Benchmarks are not returned by name, because it is possible to have
-// duplicate benchmark names, for example when the same benchmark name
-// is defined in a test and an external test.
-func (s *Server) Benchmarks(filter string, reply *[]int) error {
-	re, err := regexp.Compile(filter)
-	if err != nil {
-		return err
+func Main(m *testing.M) {
+	benchserve := flag.Bool("test.benchserve", false, "run an interactive benchmark server")
+	flag.Parse()
+	if !*benchserve {
+		os.Exit(m.Run())
 	}
 
-	var ii []int
-	for i, b := range s.benchmarks {
-		if re.MatchString(b.Name) {
-			ii = append(ii, i)
+	s := server{benchmarks: extractBenchmarks(m)}
+	s.serve()
+}
+
+func extractBenchmarks(m *testing.M) []testing.InternalBenchmark {
+	v := reflect.ValueOf(m).Elem().FieldByName("benchmarks")
+	return *(*[]testing.InternalBenchmark)(unsafe.Pointer(v.UnsafeAddr())) // :(((
+}
+
+type server struct {
+	benchmarks []testing.InternalBenchmark
+	benchmem   bool
+}
+
+func (s *server) serve() {
+	cmds := map[string]func([]string){
+		"help": s.cmdHelp,
+		"quit": s.cmdQuit,
+		"exit": s.cmdQuit,
+		"list": s.cmdList,
+		"run":  s.cmdRun,
+		"set":  s.cmdSet,
+	}
+	scanner := bufio.NewScanner(os.Stdin)
+	for scanner.Scan() {
+		fields := strings.Fields(scanner.Text())
+		if len(fields) == 0 {
+			s.cmdHelp(nil)
+			continue
 		}
+		cmd := cmds[fields[0]]
+		if cmd == nil {
+			s.cmdHelp(nil)
+			continue
+		}
+		cmd(fields[1:])
 	}
-	*reply = ii
-	return nil
-}
-
-// Run specifies a single benchmark run.
-type Run struct {
-	I int // the index of the benchmark, as returned by Benchmarks
-	N int // the number of iterations to run for
-}
-
-// Run executes a single benchmark run.
-// TODO: Reply is...what?
-func (s *Server) Run(run Run, reply *testing.BenchmarkResult) error {
-	if run.I < 0 || run.I >= len(s.benchmarks) {
-		return errors.New("bad index") // TODO: better error
+	if err := scanner.Err(); err != nil {
+		fmt.Println(err)
+		os.Exit(2)
 	}
-	b := s.benchmarks[run.I]
-	*reply = b.run(run.N)
-	return nil
 }
 
-func (s *Server) serve() {
-	rpc.Register(s)
-	l, err := net.Listen("tcp", *benchserveaddr)
-	if err != nil {
-		log.Printf("benchserve failed to listen: %v", err)
+func (s *server) cmdHelp([]string) {
+	fmt.Fprintln(os.Stderr, "commands: help, list, run, set, quit, exit")
+}
+
+func (s *server) cmdQuit([]string) {
+	os.Exit(0)
+}
+
+func (s *server) cmdList([]string) {
+	for _, b := range s.benchmarks {
+		fmt.Println(b.Name)
+	}
+	fmt.Println()
+}
+
+func (s *server) cmdSet(args []string) {
+	// TODO: What else is worth setting?
+	if len(args) < 2 || args[0] != "benchmem" {
+		fmt.Fprintln(os.Stderr, "set benchmem <bool>")
 		return
 	}
-	rpc.Accept(l)
+	b, err := strconv.ParseBool(args[1])
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "bad benchmem value:", err)
+		return
+	}
+	s.benchmem = b
 }
 
-type Benchmark struct {
-	Name string
-	F    func(*testing.B)
+func (s *server) cmdRun(args []string) {
+	if len(args) < 2 {
+		fmt.Fprintln(os.Stderr, "run <name>[-cpu] <iterations>")
+		return
+	}
+
+	name := args[0]
+	procs := 1
+	if i := strings.IndexByte(name, '-'); i != -1 {
+		var err error
+		procs, err = strconv.Atoi(name[i+1:])
+		if err != nil {
+			fmt.Fprintln(os.Stderr, "bad cpu value:", err)
+			return
+		}
+		name = name[:i]
+	}
+
+	var bench testing.InternalBenchmark
+	for _, x := range s.benchmarks {
+		if x.Name == name {
+			bench = x
+			// It is possible to define a benchmark with the same name
+			// twice in a single test binary, by defining it once
+			// in a regular test package and once in an external test package.
+			// If you do that, you probably deserve what happens to you now,
+			// namely that we run one of the two, but no guarantees which.
+			// If someday we combine multiple packages into a single
+			// test binary, then we'll probably need to invoke benchmarks
+			// by index rather than by name.
+			break
+		}
+	}
+	if bench.Name == "" {
+		fmt.Fprintln(os.Stderr, "benchmark not found:", name)
+		return
+	}
+
+	iters, err := strconv.Atoi(args[1])
+	if err != nil || iters <= 0 {
+		fmt.Fprintf(os.Stderr, "iterations must be positive, got %v\n", iters)
+		return
+	}
+
+	benchName := benchmarkName(bench.Name, procs)
+	fmt.Print(benchName, "\t")
+
+	runtime.GOMAXPROCS(procs)
+	r := runBenchmark(bench, iters)
+
+	if r.Failed {
+		fmt.Fprintln(os.Stderr, "--- FAIL:", benchName)
+		return
+	}
+	fmt.Print(r.BenchmarkResult)
+	if s.benchmem || r.ShowAllocResult {
+		fmt.Print("\t", r.MemString())
+	}
+	fmt.Println()
+	if p := runtime.GOMAXPROCS(-1); p != procs {
+		fmt.Fprintf(os.Stderr, "testing: %s left GOMAXPROCS set to %d\n", benchName, p)
+	}
 }
 
-// run runs b for the specified number of iterations.
-func (b *Benchmark) run(n int) testing.BenchmarkResult {
+// benchmarkName returns full name of benchmark including procs suffix.
+func benchmarkName(name string, n int) string {
+	if n != 1 {
+		return fmt.Sprintf("%s-%d", name, n)
+	}
+	return name
+}
+
+type Result struct {
+	testing.BenchmarkResult
+	Failed          bool
+	ShowAllocResult bool
+}
+
+// runBenchmark runs b for the specified number of iterations.
+func runBenchmark(b testing.InternalBenchmark, n int) Result {
 	var wg sync.WaitGroup
 	wg.Add(1)
 	tb := testing.B{N: n}
@@ -117,29 +193,13 @@ func (b *Benchmark) run(n int) testing.BenchmarkResult {
 	wg.Wait()
 
 	v := reflect.ValueOf(tb)
-	r := testing.BenchmarkResult{
-		N:         n,
-		T:         time.Duration(extractInt(v, "duration")),
-		Bytes:     extractInt(v, "bytes"),
-		MemAllocs: extractUint(v, "netAllocs"),
-		MemBytes:  extractUint(v, "netBytes"),
-	}
-
+	var r Result
+	r.N = n
+	r.T = time.Duration(v.FieldByName("duration").Int())
+	r.Bytes = v.FieldByName("bytes").Int()
+	r.MemAllocs = v.FieldByName("netAllocs").Uint()
+	r.MemBytes = v.FieldByName("netBytes").Uint()
+	r.Failed = v.FieldByName("failed").Bool()
+	r.ShowAllocResult = v.FieldByName("showAllocResult").Bool()
 	return r
-}
-
-func extractInt(v reflect.Value, field string) int64 {
-	x, ok := v.Type().FieldByName(field)
-	if !ok {
-		panic("failed to find testing.B field: " + field)
-	}
-	return v.FieldByIndex(x.Index).Int()
-}
-
-func extractUint(v reflect.Value, field string) uint64 {
-	x, ok := v.Type().FieldByName(field)
-	if !ok {
-		panic("failed to find testing.B field: " + field)
-	}
-	return v.FieldByIndex(x.Index).Uint()
 }
